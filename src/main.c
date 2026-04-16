@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
+#include "sd_card.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
@@ -13,19 +15,29 @@
 #include "volume_adc.h"
 #include "lcd.h"
 #include "queue.h"
+#include "ff.h"
+#include "diskio.h"
 
-void keypad_init_pins(void);
-void keypad_init_timer(void);
+// -- SD Card Pin Definitions (SPI0) --
+#define SD_MISO 16
+#define SD_CS 17
+#define SD_SCK 18
+#define SD_MOSI 19
 
-#define PIN_SDI 11
-#define PIN_CS 13
-#define PIN_SCK 10
-#define PIN_DC 14
-#define PIN_nRESET 15
+// -- LCD Pin Definitions (SPI1) --
+#define PIN_LCD_SCK 10
+#define PIN_LCD_MOSI 11
+#define PIN_LCD_CS 13
+#define PIN_LCD_DC 14
+#define PIN_LCD_nRESET 15
 
-#define LOOP_DELAY_MS  20
-#define CLIP_TICKS (2000 / LOOP_DELAY_MS)   // 2 seconds worth of 20ms ticks
+// -- Timing & Audio Constants --
+#define LOOP_DELAY_MS 20
+#define CLIP_TICKS (2000 / LOOP_DELAY_MS)
+#define SAMPLE_RATE 16000
+#define CLIP_SAMPLES (SAMPLE_RATE * 2)
 
+// -- Colors --
 #define COL_BLACK 0x0000
 #define COL_WHITE 0xFFFF
 #define COL_GREEN 0x07E0
@@ -35,35 +47,136 @@ void keypad_init_timer(void);
 #define COL_MAGENTA 0xF81F
 #define COL_ORANGE 0xFD20
 
-typedef enum {
-    STANDBY,
-    CAPTURING,
-    PLAYBACK
-} BoxState;
+typedef enum { STANDBY, CAPTURING, PLAYBACK } BoxState;
 
+static int16_t audio_buf[CLIP_SAMPLES];
+static uint32_t audio_buf_len = 0;
 static BoxState box_state = STANDBY;
 static int tick_count = 0;
 static char active_slot = 0;
+static FATFS fat_vol;
+static bool sd_ready = false;
 
-void spi_lcd_bring_up() {
-    gpio_set_function(PIN_CS, GPIO_FUNC_SIO);
-    gpio_set_function(PIN_DC, GPIO_FUNC_SIO);
-    gpio_set_function(PIN_nRESET, GPIO_FUNC_SIO);
-    gpio_set_dir(PIN_CS, GPIO_OUT);
-    gpio_set_dir(PIN_DC, GPIO_OUT);
-    gpio_set_dir(PIN_nRESET, GPIO_OUT);
-    gpio_put(PIN_CS, 1);
-    gpio_put(PIN_DC,0);
-    gpio_put(PIN_nRESET,0);
-    sleep_ms(50);
-    gpio_put(PIN_nRESET,1);
-    sleep_ms(50);
-    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SDI, GPIO_FUNC_SPI);
-    spi_init(spi1,20000000);
-    spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+// -- UART Driver Implementation --
+void init_uart() {
+    gpio_set_function(0, GPIO_FUNC_UART);
+    gpio_set_function(1, GPIO_FUNC_UART);
+    uart_init(uart0, 115200);
+    uart_get_hw(uart0)->lcr_h = (3 << 5) | (1 << 4);
 }
 
+int _write(__unused int handle, char *buffer, int length) {
+    int i = 0;
+    while (i < length && buffer[i] != '\0') {
+        uart_write_blocking(uart0, (uint8_t *)&buffer[i], 1);
+        i++;
+    }
+    return length;
+}
+
+// -- Forward Declarations --
+void keypad_init_pins(void);
+void keypad_init_timer(void);
+
+
+void sd_mount() {
+    
+    sleep_ms(2000);
+    // 1. Force SPI0 to a known 'Clean' state
+    spi_deinit(spi0); 
+    sleep_ms(10);
+    
+    // 2. Re-init at the slow 'Identification' speed (400kHz)
+    // Most cards FAIL to mount if you start at 12MHz
+    spi_init(spi0, 400 * 1000); 
+    
+    // 3. Force Pin Muxing
+    gpio_set_function(SD_SCK,  GPIO_FUNC_SPI);
+    gpio_set_function(SD_MOSI, GPIO_FUNC_SPI);
+    gpio_set_function(SD_MISO, GPIO_FUNC_SPI);
+    
+    // 4. Manual Chip Select Control
+    gpio_init(SD_CS);
+    gpio_set_dir(SD_CS, GPIO_OUT);
+    gpio_put(SD_CS, 1); // Hold high (inactive)
+    
+    printf("Hardware reset. Attempting mount...\n");
+    sleep_ms(100);
+
+    FRESULT fr = f_mount(&fat_vol, "", 1);
+    
+    if (fr != FR_OK) {
+        printf("CRITICAL: Mount failed with error %d\n", fr);
+    } else {
+        printf("MOUNT SUCCESS\n");
+        sd_ready = true;
+        // ONLY NOW switch to high speed
+        spi_set_baudrate(spi0, 12 * 1000 * 1000); 
+    }
+}
+
+// -- SD File Operations --
+static void slot_filename(char slot, char *out) {
+    sprintf(out, "S%c.RAW", slot);
+}
+
+void sd_save_clip(char slot) {
+    if (!sd_ready) { printf("SAVE FAIL: SD not ready\r\n"); return; }
+    char fname[16];
+    slot_filename(slot, fname);
+    FIL fil;
+    UINT bw;
+    FRESULT fr = f_open(&fil, fname, FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr == FR_OK) {
+        f_write(&fil, audio_buf, audio_buf_len * sizeof(int16_t), &bw);
+        f_close(&fil);
+        printf("FILE WRITTEN: %s (%u bytes)\r\n", fname, bw);
+    } else {
+        printf("FILE OPEN ERROR (SAVE): %d\r\n", fr);
+    }
+}
+
+uint32_t sd_load_clip(char slot) {
+    if (!sd_ready) { printf("LOAD FAIL: SD not ready\r\n"); return 0; }
+    char fname[16];
+    slot_filename(slot, fname);
+    FIL fil;
+    UINT br;
+    FRESULT fr = f_open(&fil, fname, FA_READ);
+    if (fr != FR_OK) {
+        printf("FILE OPEN ERROR (LOAD): %d for file %s\r\n", fr, fname);
+        return 0;
+    }
+    f_read(&fil, audio_buf, CLIP_SAMPLES * sizeof(int16_t), &br);
+    f_close(&fil);
+    return br / sizeof(int16_t);
+}
+
+// -- LCD Implementation --
+void spi_lcd_bring_up() {
+    gpio_init(PIN_LCD_CS);
+    gpio_init(PIN_LCD_DC);
+    gpio_init(PIN_LCD_nRESET);
+    gpio_set_dir(PIN_LCD_CS, GPIO_OUT);
+    gpio_set_dir(PIN_LCD_DC, GPIO_OUT);
+    gpio_set_dir(PIN_LCD_nRESET, GPIO_OUT);
+    
+    gpio_put(PIN_LCD_CS, 1);
+    gpio_put(PIN_LCD_DC, 0);
+    gpio_put(PIN_LCD_nRESET, 0); // Active Low Reset
+    sleep_ms(50);
+    gpio_put(PIN_LCD_nRESET, 1);
+    sleep_ms(50);
+
+    spi_init(spi1, 20 * 1000 * 1000);
+    gpio_set_function(PIN_LCD_SCK,  GPIO_FUNC_SPI);
+    gpio_set_function(PIN_LCD_MOSI, GPIO_FUNC_SPI);
+    spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    
+    printf("Hardware: SPI1 initialized for LCD (GP10-15)\r\n");
+}
+
+// -- UI Rendering Functions --
 void ui_hint_row() {
     LCD_DrawFillRectangle(0, 210, 240, 240, COL_BLACK);
     LCD_DrawString(10, 215, COL_WHITE, COL_BLACK, "1-D:SEL *:REC 0:PLY", 20, 0);
@@ -97,8 +210,8 @@ void ui_state_banner(BoxState st, char slot) {
 void ui_progress(int ticks_left) {
     if (ticks_left < 0) ticks_left = 0;
     int fill = (ticks_left * 200) / CLIP_TICKS;
-    LCD_DrawFillRectangle(20,130, 20 + fill, 145, COL_CYAN);
-    LCD_DrawFillRectangle(20 + fill, 130, 220,145, COL_GRAY);
+    LCD_DrawFillRectangle(20, 130, 20 + fill, 145, COL_CYAN);
+    LCD_DrawFillRectangle(20 + fill, 130, 220, 145, COL_GRAY);
 }
 
 void ui_clear_progress() {
@@ -110,18 +223,25 @@ void ui_vol_strip(int pct) {
     sprintf(tmp, "VOL: %d%%", pct);
     LCD_DrawString(10, 175, COL_WHITE, COL_BLACK, tmp, 16, 0);
     int fill = (pct * 140) / 100;
-    LCD_DrawFillRectangle(85,178, 85 + fill, 188, COL_GREEN);
-    LCD_DrawFillRectangle(85 + fill, 178, 225,188, COL_GRAY);
+    LCD_DrawFillRectangle(85, 178, 85 + fill, 188, COL_GREEN);
+    LCD_DrawFillRectangle(85 + fill, 178, 225, 188, COL_GRAY);
 }
 
+// -- Main Execution Loop --
 int main() {
-    stdio_init_all();
+    init_uart();
+    setbuf(stdout, NULL);
+
     spi_lcd_bring_up();
     LCD_Setup();
     LCD_Clear(COL_BLACK);
+    
     init_volume_adc();
     keypad_init_pins();
     keypad_init_timer();
+    
+    init_sdcard_io();
+    sd_mount();
 
     ui_hint_row();
     ui_slot_header(active_slot);
@@ -131,39 +251,44 @@ int main() {
     char prev_slot = 0;
 
     while (1) {
-        // volume knob
+        //printf("System Startup...\r\n");
         uint16_t raw_knob = read_volume_raw();
         int vol_pct = (raw_knob * 100) / 4095;
         ui_vol_strip(vol_pct);
 
-        // keypad
         uint16_t ev = 0;
         if (kev.head != kev.tail) ev = key_pop();
 
         if (ev != 0) {
-            bool dn  = (ev >> 8) & 1;
+            bool dn = (ev >> 8) & 1;
             char key = (char)(ev & 0xFF);
-
             if (dn) {
                 if ((key >= '1' && key <= '9') || (key >= 'A' && key <= 'D')) {
                     active_slot = key;
-                } 
-                else if (key == '*' && active_slot != 0 && box_state == STANDBY) {
-                    box_state  = CAPTURING;
+                    printf("\r\n--- Slot selected: %c ---\r\n", active_slot);
+                } else if (key == '*' && active_slot != 0 && box_state == STANDBY) {
+                    audio_buf_len = 0;
+                    memset(audio_buf, 0, sizeof(audio_buf));
+                    box_state = CAPTURING;
                     tick_count = 0;
-                } 
-                else if (key == '0' && active_slot != 0 && box_state == STANDBY) {
-                    box_state  = PLAYBACK;
-                    tick_count = 0;
-                } 
-                else if (key == '#') {
+                    printf("Action: Recording to S%c.RAW...\r\n", active_slot);
+                } else if (key == '0' && active_slot != 0 && box_state == STANDBY) {
+                    uint32_t loaded = sd_load_clip(active_slot);
+                    if (loaded > 0) {
+                        audio_buf_len = loaded;
+                        printf("SUCCESS: Loaded %lu samples from S%c.RAW\r\n", (unsigned long)audio_buf_len, active_slot);
+                        box_state = PLAYBACK;
+                        tick_count = 0;
+                    } else {
+                        printf("ERROR: Could not load S%c.RAW\r\n", active_slot);
+                    }
+                } else if (key == '#') {
                     box_state = STANDBY;
                     ui_clear_progress();
                 }
             }
         }
 
-        // redraw only on change
         if (active_slot != prev_slot) {
             ui_slot_header(active_slot);
             prev_slot = active_slot;
@@ -174,18 +299,21 @@ int main() {
             if (box_state == STANDBY) ui_clear_progress();
         }
 
-        // tick-based timer
         if (box_state != STANDBY) {
             tick_count++;
             ui_progress(CLIP_TICKS - tick_count);
-
             if (tick_count >= CLIP_TICKS) {
+                if (box_state == CAPTURING) {
+                    // Simulating audio capture with random data for testing
+                    for (int i = 0; i < CLIP_SAMPLES; i++) audio_buf[i] = (int16_t)(rand() % 32767);
+                    audio_buf_len = CLIP_SAMPLES;
+                    sd_save_clip(active_slot);
+                }
                 box_state = STANDBY;
                 tick_count = 0;
                 ui_clear_progress();
             }
         }
-
         sleep_ms(LOOP_DELAY_MS);
     }
 }
