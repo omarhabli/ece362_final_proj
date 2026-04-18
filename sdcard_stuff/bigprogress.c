@@ -39,9 +39,9 @@
 
 // -- Timing & Audio Constants --
 #define LOOP_DELAY_MS 20
-#define CLIP_TICKS (1000 / LOOP_DELAY_MS)
+#define CLIP_TICKS (2000 / LOOP_DELAY_MS)
 #define SAMPLE_RATE 16000
-#define CLIP_SAMPLES (SAMPLE_RATE * 1)
+#define CLIP_SAMPLES (SAMPLE_RATE * 2)
 
 // -- Colors --
 #define COL_BLACK 0x0000
