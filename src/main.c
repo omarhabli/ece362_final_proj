@@ -2,8 +2,8 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
-#include "sd_card.h"
 #include "pico/stdlib.h"
+#include "sd_card.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
@@ -12,16 +12,19 @@
 #include "hardware/pwm.h"
 #include "hardware/adc.h"
 #include "hardware/uart.h"
+#include "hardware/clocks.h"
 #include "volume_adc.h"
 #include "lcd.h"
 #include "queue.h"
 #include "ff.h"
 #include "diskio.h"
+#include "mic.h"
+#include "i2s_rx_master.pio.h"
 
-//MAY WANT TO ADD SOME ANIMATION WHILE LOADING TO AND
-//FROM SD CARD
+// MAY WANT TO ADD SOME ANIMATION WHILE LOADING TO AND
+// FROM SD CARD
 
-//REMEMBER TO GET RID OF ALL PRINTS
+// REMEMBER TO GET RID OF ALL PRINTS
 
 // -- SD Card Pin Definitions (SPI0) --
 #define SD_MISO 16
@@ -40,7 +43,7 @@
 // -- Timing & Audio Constants --
 #define LOOP_DELAY_MS 20
 #define CLIP_TICKS (1000 / LOOP_DELAY_MS)
-#define SAMPLE_RATE 16000
+#define SAMPLE_RATE 48000
 #define CLIP_SAMPLES (SAMPLE_RATE * 1)
 
 // -- Colors --
@@ -53,9 +56,13 @@
 #define COL_MAGENTA 0xF81F
 #define COL_ORANGE 0xFD20
 
+// -- PIO mic pins --
+#define PIO_SCK 20
+#define PIO_WS 21
+#define PIO_DO 22
+
 typedef enum { STANDBY, CAPTURING, PLAYBACK } BoxState;
 
-static int16_t audio_buf[CLIP_SAMPLES];
 static uint32_t audio_buf_len = 0;
 static BoxState box_state = STANDBY;
 static int tick_count = 0;
@@ -66,18 +73,11 @@ static volatile uint32_t playback_pos = 0;
 static volatile bool playing = false;
 static volatile int vol_pct_global = 100;
 
-
-//Fake I2S: 
-void fake_i2s_fill() {
-    audio_buf_len = CLIP_SAMPLES;
-
-    for (int i = 0; i < audio_buf_len; i++) {
-        // simple waveform so it's not random garbage
-        audio_buf[i] = (int16_t)(10000 * sinf(2 * 3.14159f * i / 20));
-    }
-
-    printf("Fake I2S filled buffer with %lu samples\n", audio_buf_len);
-}
+// mic / audio buffers
+static i2s_rx_master_t mic_ctx;
+static uint32_t mic_raw_buf[CLIP_SAMPLES];
+static int16_t audio_buf[CLIP_SAMPLES];
+extern volatile bool recording_done;
 
 void print_audio_buffer() {
     printf("---- PRINTING BUFFER ----\n");
@@ -89,8 +89,7 @@ void print_audio_buffer() {
     printf("---- DONE ----\n");
 }
 
-// //PWM STUFF: 
-
+// PWM playback
 void pwm_playback_handler() {
     uint s0 = pwm_gpio_to_slice_num(36);
     pwm_clear_irq(s0);
@@ -100,14 +99,13 @@ void pwm_playback_handler() {
     if (playback_pos >= audio_buf_len) {
         playing = false;
         playback_pos = 0;
+        pwm_set_gpio_level(36, 0);
         return;
     }
 
-    // Scale int16_t sample (-32768 to 32767) to PWM range (0 to period)
     uint32_t period = pwm_hw->slice[s0].top;
     int32_t samp = audio_buf[playback_pos++];
     samp = (samp * vol_pct_global) / 100;
-    // shift from signed to unsigned, scale to period
     uint32_t level = ((samp + 32768) * period) / 65535;
     pwm_set_gpio_level(36, level);
 }
@@ -119,9 +117,7 @@ void init_pwm_audio_out() {
 
     pwm_config cfg = pwm_get_default_config();
     pwm_config_set_clkdiv(&cfg, 125.0f);
-
-    // Then wrap so interrupt = 16kHz
-    pwm_config_set_wrap(&cfg, (1000000 / AUDIO_SAMPLE_RATE) - 1);      // 8-bit resolution
+    pwm_config_set_wrap(&cfg, (1000000 / AUDIO_SAMPLE_RATE) - 1);
     pwm_set_chan_level(s0, c0, 0);
     pwm_set_irq0_enabled(s0, true);
     irq_set_exclusive_handler(PWM_DEFAULT_IRQ_NUM(), pwm_playback_handler);
@@ -155,40 +151,33 @@ int _write(__unused int handle, char *buffer, int length) {
 void keypad_init_pins(void);
 void keypad_init_timer(void);
 
-
 void sd_mount() {
-    
     sleep_ms(2000);
-    // 1. Force SPI0 to a known 'Clean' state
-    spi_deinit(spi0); 
+
+    spi_deinit(spi0);
     sleep_ms(10);
-    
-    // 2. Re-init at the slow 'Identification' speed (400kHz)
-    // Most cards FAIL to mount if you start at 12MHz
-    spi_init(spi0, 400 * 1000); 
-    
-    // 3. Force Pin Muxing
-    gpio_set_function(SD_SCK,  GPIO_FUNC_SPI);
+
+    spi_init(spi0, 400 * 1000);
+
+    gpio_set_function(SD_SCK, GPIO_FUNC_SPI);
     gpio_set_function(SD_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SD_MISO, GPIO_FUNC_SPI);
-    
-    // 4. Manual Chip Select Control
+
     gpio_init(SD_CS);
     gpio_set_dir(SD_CS, GPIO_OUT);
-    gpio_put(SD_CS, 1); // Hold high (inactive)
-    
+    gpio_put(SD_CS, 1);
+
     printf("Hardware reset. Attempting mount...\n");
     sleep_ms(100);
 
     FRESULT fr = f_mount(&fat_vol, "", 1);
-    
+
     if (fr != FR_OK) {
         printf("CRITICAL: Mount failed with error %d\n", fr);
     } else {
         printf("MOUNT SUCCESS\n");
         sd_ready = true;
-        // ONLY NOW switch to high speed
-        spi_set_baudrate(spi0, 12 * 1000 * 1000); 
+        spi_set_baudrate(spi0, 12 * 1000 * 1000);
     }
 }
 
@@ -198,7 +187,11 @@ static void slot_filename(char slot, char *out) {
 }
 
 void sd_save_clip(char slot) {
-    if (!sd_ready) { printf("SAVE FAIL: SD not ready\r\n"); return; }
+    if (!sd_ready) {
+        printf("SAVE FAIL: SD not ready\r\n");
+        return;
+    }
+
     char fname[16];
     slot_filename(slot, fname);
     FIL fil;
@@ -214,7 +207,11 @@ void sd_save_clip(char slot) {
 }
 
 uint32_t sd_load_clip(char slot) {
-    if (!sd_ready) { printf("LOAD FAIL: SD not ready\r\n"); return 0; }
+    if (!sd_ready) {
+        printf("LOAD FAIL: SD not ready\r\n");
+        return 0;
+    }
+
     char fname[16];
     slot_filename(slot, fname);
     FIL fil;
@@ -224,6 +221,7 @@ uint32_t sd_load_clip(char slot) {
         printf("FILE OPEN ERROR (LOAD): %d for file %s\r\n", fr, fname);
         return 0;
     }
+
     f_read(&fil, audio_buf, CLIP_SAMPLES * sizeof(int16_t), &br);
     f_close(&fil);
     return br / sizeof(int16_t);
@@ -237,19 +235,19 @@ void spi_lcd_bring_up() {
     gpio_set_dir(PIN_LCD_CS, GPIO_OUT);
     gpio_set_dir(PIN_LCD_DC, GPIO_OUT);
     gpio_set_dir(PIN_LCD_nRESET, GPIO_OUT);
-    
+
     gpio_put(PIN_LCD_CS, 1);
     gpio_put(PIN_LCD_DC, 0);
-    gpio_put(PIN_LCD_nRESET, 0); // Active Low Reset
+    gpio_put(PIN_LCD_nRESET, 0);
     sleep_ms(50);
     gpio_put(PIN_LCD_nRESET, 1);
     sleep_ms(50);
 
     spi_init(spi1, 20 * 1000 * 1000);
-    gpio_set_function(PIN_LCD_SCK,  GPIO_FUNC_SPI);
+    gpio_set_function(PIN_LCD_SCK, GPIO_FUNC_SPI);
     gpio_set_function(PIN_LCD_MOSI, GPIO_FUNC_SPI);
     spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-    
+
     printf("Hardware: SPI1 initialized for LCD (GP10-15)\r\n");
 }
 
@@ -263,8 +261,7 @@ void ui_slot_header(char slot) {
     LCD_DrawFillRectangle(0, 0, 240, 45, COL_BLACK);
     if (slot == 0) {
         LCD_DrawString(25, 12, COL_YELLOW, COL_BLACK, "SELECT A SLOT", 20, 0);
-    } 
-    else {
+    } else {
         char tmp[20];
         sprintf(tmp, "SLOT: [%c]", slot);
         LCD_DrawString(50, 10, COL_MAGENTA, COL_BLACK, tmp, 24, 0);
@@ -315,13 +312,24 @@ int main() {
     spi_lcd_bring_up();
     LCD_Setup();
     LCD_Clear(COL_BLACK);
-    
+
     init_volume_adc();
     keypad_init_pins();
     keypad_init_timer();
-    
+
     init_sdcard_io();
     sd_mount();
+
+    mic_init(
+        &mic_ctx,
+        pio0,
+        0,
+        PIO_SCK,
+        PIO_WS,
+        PIO_DO,
+        SAMPLE_RATE,
+        32
+    );
 
     ui_hint_row();
     ui_slot_header(active_slot);
@@ -331,7 +339,6 @@ int main() {
     char prev_slot = 0;
 
     while (1) {
-        //printf("System Startup...\r\n");
         uint16_t raw_knob = read_volume_raw();
         int vol_pct = (raw_knob * 100) / 4095;
         vol_pct_global = vol_pct;
@@ -349,7 +356,10 @@ int main() {
                     printf("\r\n--- Slot selected: %c ---\r\n", active_slot);
                 } else if (key == '*' && active_slot != 0 && box_state == STANDBY) {
                     audio_buf_len = 0;
+                    recording_done = false;
+                    memset(mic_raw_buf, 0, sizeof(mic_raw_buf));
                     memset(audio_buf, 0, sizeof(audio_buf));
+                    mic_start_capture(&mic_ctx, mic_raw_buf, CLIP_SAMPLES);
                     box_state = CAPTURING;
                     tick_count = 0;
                     printf("Action: Recording to S%c.RAW...\r\n", active_slot);
@@ -358,7 +368,6 @@ int main() {
                     if (loaded > 0) {
                         audio_buf_len = loaded;
                         printf("SUCCESS: Loaded %lu samples from S%c.RAW\r\n", (unsigned long)audio_buf_len, active_slot);
-                        //print_audio_buffer();
                         box_state = PLAYBACK;
                         tick_count = 0;
                         start_playback();
@@ -366,7 +375,13 @@ int main() {
                         printf("ERROR: Could not load S%c.RAW\r\n", active_slot);
                     }
                 } else if (key == '#') {
+                    if (box_state == CAPTURING) {
+                        mic_stop_capture(&mic_ctx);
+                    }
+                    playing = false;
+                    playback_pos = 0;
                     box_state = STANDBY;
+                    tick_count = 0;
                     ui_clear_progress();
                 }
             }
@@ -382,24 +397,36 @@ int main() {
             if (box_state == STANDBY) ui_clear_progress();
         }
 
-        if (box_state != STANDBY) {
-            tick_count++;
+        if (box_state == CAPTURING) {
+            if (tick_count < CLIP_TICKS) tick_count++;
             ui_progress(CLIP_TICKS - tick_count);
-            if (tick_count >= CLIP_TICKS) {
-                if (box_state == CAPTURING) {
-                    // Simulating audio capture with random data for testing
-                    fake_i2s_fill();        // simulate mic/I2S input
-                    sd_save_clip(active_slot);
-                }
-                else if (box_state == PLAYBACK) {
-                    playing = false;   
-                    playback_pos = 0;
-                }
-                box_state = STANDBY;
-                tick_count = 0;
-                ui_clear_progress();
-            }
+        } else if (box_state == PLAYBACK) {
+            if (tick_count < CLIP_TICKS) tick_count++;
+            ui_progress(CLIP_TICKS - tick_count);
         }
+
+        if (box_state == CAPTURING && recording_done) {
+            recording_done = false;
+
+            for (uint32_t i = 0; i < CLIP_SAMPLES; i++) {
+                int32_t s = (int32_t)(mic_raw_buf[i] << 8) >> 8;
+                audio_buf[i] = (int16_t)(s >> 8);
+            }
+
+            audio_buf_len = CLIP_SAMPLES;
+            sd_save_clip(active_slot);
+
+            box_state = STANDBY;
+            tick_count = 0;
+            ui_clear_progress();
+        }
+
+        if (box_state == PLAYBACK && !playing) {
+            box_state = STANDBY;
+            tick_count = 0;
+            ui_clear_progress();
+        }
+
         sleep_ms(LOOP_DELAY_MS);
     }
 }
