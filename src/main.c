@@ -38,7 +38,8 @@
 #define PIN_LCD_CS 13
 #define PIN_LCD_DC 14
 #define PIN_LCD_nRESET 15
-#define AUDIO_SAMPLE_RATE 16000
+#define AUDIO_SAMPLE_RATE 38000
+#define GAIN 4
 
 // -- Timing & Audio Constants --
 #define LOOP_DELAY_MS 20
@@ -106,6 +107,7 @@ void pwm_playback_handler() {
     uint32_t period = pwm_hw->slice[s0].top;
     int32_t samp = audio_buf[playback_pos++];
     samp = (samp * vol_pct_global) / 100;
+    samp *= GAIN;
     uint32_t level = ((samp + 32768) * period) / 65535;
     pwm_set_gpio_level(36, level);
 }
