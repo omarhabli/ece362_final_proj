@@ -11,7 +11,7 @@
 #include "ff.h"
 #include "diskio.h"
 
-#define SD_MISO 16
+#define SD_MISO 32
 #define SD_CS 17
 #define SD_SCK 18
 #define SD_MOSI 19
