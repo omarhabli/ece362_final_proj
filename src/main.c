@@ -27,7 +27,7 @@
 // REMEMBER TO GET RID OF ALL PRINTS
 
 // -- SD Card Pin Definitions (SPI0) --
-#define SD_MISO 16
+#define SD_MISO 32
 #define SD_CS 17
 #define SD_SCK 18
 #define SD_MOSI 19
